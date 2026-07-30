@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Air Juggler - Webcam Game</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #1a1a2e;
+      color: #ffffff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    h1 {
+      margin: 10px 0 5px 0;
+      font-size: 2rem;
+      text-shadow: 0 0 10px rgba(0,255,200,0.5);
+    }
+
+    #game-container {
+      position: relative;
+      width: 640px;
+      height: 480px;
+      border: 4px solid #0f3460;
+      border-radius: 12px;
+      box-shadow: 0 0 20px rgba(0, 0, 0, 0.6);
+      overflow: hidden;
+    }
+
+    /* Video element hidden off-screen (used for MediaPipe input) */
+    #webcam {
+      display: none;
+    }
+
+    /* Canvas overlaid for rendering hand tracking and balls */
+    #gameCanvas {
+      width: 100%;
+      height: 100%;
+      transform: scaleX(-1); /* Mirror camera feed for natural interaction */
+    }
+
+    #ui-overlay {
+      position: absolute;
+      top: 15px;
+      left: 15px;
+      right: 15px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 1.2rem;
+      font-weight: bold;
+      pointer-events: none;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+    }
+
+    #loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 1.2rem;
+      background: rgba(0, 0, 0, 0.8);
+      padding: 15px 25px;
+      border-radius: 8px;
+    }
+  </style>
+
+  <!-- TensorFlow.js Core & MediaPipe Hands Detector -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/hand-pose-detection"></script>
+</head>
+<body>
+
+  <h1>🤹 Air Juggler</h1>
+
+  <div id="game-container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="gameCanvas" width="640" height="480"></canvas>
+    
+    <div id="ui-overlay">
+      <div>Score: <span id="score">0</span></div>
+      <div>Lives: <span id="lives">3</span></div>
+    </div>
+
+    <div id="loading">Loading Camera & ML Models...</div>
+  </div>
+
+  <script>
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const livesEl = document.getElementById('lives');
+    const loadingEl = document.getElementById('loading');
+
+    let detector;
+    let score = 0;
+    let lives = 3;
+    let gameOver = false;
+
+    // Ball Object Structure
+    class Ball {
+      constructor() {
+        this.reset();
+      }
+
+      reset() {
+        this.radius = 20;
+        this.x = Math.random() * (canvas.width - this.radius * 2) + this.radius;
+        this.y = -this.radius;
+        this.vx = (Math.random() - 0.5) * 4;
+        this.vy = Math.random() * 2 + 1;
+        this.color = `hsl(${Math.random() * 360}, 80%, 60%)`;
+      }
+
+      update() {
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Apply gravity
+        this.vy += 0.15;
+
+        // Bounce off side walls
+        if (this.x - this.radius <= 0 || this.x + this.radius >= canvas.width) {
+          this.vx *= -1;
+        }
+
+        // Drop below screen (Lost life)
+        if (this.y - this.radius > canvas.height) {
+          lives--;
+          livesEl.textContent = lives;
+          if (lives <= 0) {
+            gameOver = true;
+          } else {
+            this.reset();
+          }
+        }
+      }
+
+      draw() {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+        ctx.fillStyle = this.color;
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+        ctx.closePath();
+      }
+    }
+
+    const balls = [new Ball()];
+
+    // WebCam Initialization
+    async function setupCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480 },
+        audio: false
+      });
+      video.srcObject = stream;
+      return new Promise((resolve) => {
+        video.onloadedmetadata = () => resolve(video);
+      });
+    }
+
+    // Initialize TensorFlow / MediaPipe Hand Detector
+    async function loadHandDetector() {
+      const model = handPoseDetection.SupportedModels.MediaPipeHands;
+      const detectorConfig = {
+        runtime: 'mediapipe',
+        solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/hands',
+        modelType: 'full',
+        maxHands: 2
+      };
+      detector = await handPoseDetection.createDetector(model, detectorConfig);
+    }
+
+    // Check collision between key hand points and balls
+    function checkCollisions(hands) {
+      hands.forEach(hand => {
+        // Use key landmarks: Palm/Index/Middle fingertips for hit detection
+        const keypoints = hand.keypoints.filter(kp => 
+          ['index_finger_tip', 'middle_finger_tip', 'ring_finger_tip', 'wrist', 'palm_center'].includes(kp.name)
+        );
+
+        keypoints.forEach(kp => {
+          // Keypoints are natively relative to un-mirrored video coordinates
+          const handX = kp.x;
+          const handY = kp.y;
+
+          balls.forEach(ball => {
+            const dist = Math.hypot(ball.x - handX, ball.y - handY);
+            
+            // If hand keypoint touches the ball
+            if (dist < ball.radius + 15 && ball.vy > 0) {
+              ball.vy = -Math.abs(ball.vy) - 2; // Bounce back up
+              ball.vx += (Math.random() - 0.5) * 4; // Add slight lateral randomness
+              score += 10;
+              scoreEl.textContent = score;
+
+              // Add a new ball every 50 points (max 4 balls)
+              if (score % 50 === 0 && balls.length < 4) {
+                balls.push(new Ball());
+              }
+            }
+          });
+        });
+      });
+    }
+
+    // Main Game Loop
+    async function gameLoop() {
+      // 1. Draw video feed on canvas
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      if (!gameOver) {
+        // 2. Detect Hands
+        const hands = await detector.estimateHands(video);
+
+        // 3. Render Hand Keypoints & Check Collisions
+        hands.forEach(hand => {
+          hand.keypoints.forEach(kp => {
+            ctx.beginPath();
+            ctx.arc(kp.x, kp.y, 6, 0, Math.PI * 2);
+            ctx.fillStyle = '#00ffcc';
+            ctx.fill();
+          });
+        });
+
+        checkCollisions(hands);
+
+        // 4. Update & Draw Balls
+        balls.forEach(ball => {
+          ball.update();
+          ball.draw();
+        });
+
+      } else {
+        // Render Game Over Screen
+        ctx.save();
+        ctx.scale(-1, 1); // Flip text back horizontally so it renders correctly
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+        ctx.fillRect(-canvas.width, 0, canvas.width, canvas.height);
+
+        ctx.fillStyle = '#ff4d4d';
+        ctx.font = 'bold 36px Segoe UI';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', -canvas.width / 2, canvas.height / 2 - 20);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '20px Segoe UI';
+        ctx.fillText(`Final Score: ${score}`, -canvas.width / 2, canvas.height / 2 + 20);
+        ctx.fillText('Refresh page to play again', -canvas.width / 2, canvas.height / 2 + 60);
+        ctx.restore();
+      }
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // Initialize Game
+    async function init() {
+      try {
+        await setupCamera();
+        await video.play();
+        await loadHandDetector();
+
+        loadingEl.style.display = 'none';
+        gameLoop();
+      } catch (err) {
+        loadingEl.textContent = 'Error starting camera/model: ' + err.message;
+        console.error(err);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
